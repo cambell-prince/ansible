@@ -20,6 +20,7 @@ import os
 from ansible import utils
 import ansible.constants as C
 import ansible.utils.template as template
+from ansible.utils.vault import VaultLib
 from ansible import errors
 from ansible.runner.return_data import ReturnData
 import base64
@@ -160,7 +161,30 @@ class ActionModule(object):
         # expand any user home dir specifier
         dest = self.runner._remote_expand_user(conn, dest, tmp_path)
 
+        vault = VaultLib(password=self.runner.vault_pass)
+
         for source_full, source_rel in source_files:
+            
+            vault_temp_file = None
+            data = None
+
+            try:
+                data = open(source_full).read()
+            except IOError:
+                raise errors.AnsibleError("file could not read: %s" % source_full)
+
+            if vault.is_encrypted(data):
+                # if the file is encrypted and no password was specified,
+                # the decrypt call would throw an error, but we check first
+                # since the decrypt function doesn't know the file name
+                if self.runner.vault_pass is None:
+                    raise errors.AnsibleError("A vault password must be specified to decrypt %s" % source_full)
+                    
+                data = vault.decrypt(data)
+                # Make a temp file
+                vault_temp_file = self._create_content_tempfile(data)
+                source_full = vault_temp_file;
+            
             # Generate a hash of the local file.
             local_checksum = utils.checksum(source_full)
 
@@ -233,6 +257,11 @@ class ActionModule(object):
                 # We have copied the file remotely and no longer require our content_tempfile
                 self._remove_tempfile_if_content_defined(content, content_tempfile)
 
+                # Remove the vault tempfile if we have one
+                if vault_temp_file:
+                    os.remove(vault_temp_file);
+                    vault_temp_file = None
+
                 # fix file permissions when the copy is done as a different user
                 if self.runner.become and self.runner.become_user != 'root' and not raw:
                     self.runner._remote_chmod(conn, 'a+r', tmp_src, tmp_path)
@@ -264,6 +293,11 @@ class ActionModule(object):
                 # no need to transfer the file, already correct hash, but still need to call
                 # the file module in case we want to change attributes
                 self._remove_tempfile_if_content_defined(content, content_tempfile)
+                
+                # Remove the vault tempfile if we have one
+                if vault_temp_file:
+                    os.remove(vault_temp_file);
+                    vault_temp_file = None
 
                 if raw:
                     # Continue to next iteration if raw is defined.
